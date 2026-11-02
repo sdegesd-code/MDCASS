@@ -255,13 +255,13 @@
 
       <!-- Assessment Bill Arrear mode only: pull unpaid prepared bills (older than N days) straight from the sheet -->
       <div id="sheetLoader" style="display:none; border:1px dashed var(--amber); background:#fffaf0; border-radius:8px; padding:14px; margin-bottom:16px;">
-        <label style="color:var(--navy);">Load unpaid assessment bills from the Google Sheet</label>
+        <label id="sh_title" style="color:var(--navy);">Load unpaid assessment bills from the Google Sheet</label>
         <div class="grid" style="margin-top:8px;">
           <div class="field" style="grid-column:1/-1;">
             <label>Apps Script web app URL</label>
             <input type="text" id="sh_url" value="https://script.google.com/macros/s/AKfycbwA1D2ndvQx7oWyTs8DSkN44mgxSDYTJJXYehH_hHJXRNE2BgiR_3SzNBexDyRsYb3Q/exec">
           </div>
-          <div class="field">
+          <div class="field" id="sh_days_wrap">
             <label>Bill prepared at least this many days ago</label>
             <input type="text" id="sh_days" value="7">
           </div>
@@ -356,7 +356,11 @@ function setMode(newMode){
   mode = newMode;
   document.getElementById('tabMDC').classList.toggle('active', mode === 'MDC');
   document.getElementById('tabASS').classList.toggle('active', mode === 'ASS');
-  document.getElementById('sheetLoader').style.display = (mode === 'ASS') ? 'block' : 'none';
+  document.getElementById('sheetLoader').style.display = 'block';
+  document.getElementById('sh_title').innerText = (mode === 'ASS')
+    ? 'Load unpaid assessment bills from the Google Sheet'
+    : 'Load MDC cases (active + old connection) from the MDC_Notices tab';
+  document.getElementById('sh_days_wrap').style.display = (mode === 'ASS') ? '' : 'none';
   
   if(mode === 'MDC'){
     document.getElementById('lblBoxData').innerText = "Box 2: Consumer Data (7 Cols: B No, B Name, B Addr, B Amt, A No, A Name, A Addr)";
@@ -782,19 +786,20 @@ function shUrl(){
 }
 
 async function loadFromSheet(){
-  if(mode !== 'ASS') return;
   if(!val('sh_url').trim()){ shStatus('Paste the Apps Script web app URL first.', true); return; }
+  const isMdc = (mode === 'MDC');
   const days = parseInt(val('sh_days'), 10);
   const inc = document.getElementById('sh_inc').checked ? '1' : '0';
   shStatus('Loading from sheet...');
   let j;
   try {
-    const res = await fetch(shUrl() + 'source=assessmentNotice&days=' + (isNaN(days) ? 7 : days) + '&includeNoticed=' + inc);
+    const res = await fetch(shUrl() + 'source=' + (isMdc ? 'mdcNotice' : 'assessmentNotice') + '&days=' + (isNaN(days) ? 7 : days) + '&includeNoticed=' + inc);
     j = await res.json();
   } catch(err){
     shStatus('Could not read the sheet. Check the URL, and that the latest Code.gs is deployed as a New version.', true);
     return;
   }
+  if(j && j.error){ shStatus(esc(j.error), true); return; }
   if(!j || !Array.isArray(j.rows)){
     shStatus('The sheet answered in an unexpected format. Deploy the latest Code.gs as a New version.', true);
     return;
@@ -802,28 +807,46 @@ async function loadFromSheet(){
 
   const date = val('sh_date').trim() || todayDMY();
   const start = parseInt(val('sh_start'), 10);
+  const refOf = (idx) => isNaN(start) ? "" : String(start + idx);
   rows = [];
   j.rows.forEach((r, idx) => {
-    rows.push({
-      ref: isNaN(start) ? "" : String(start + idx),
-      date: date,
-      aNo: r.consNo, aName: r.name, address: r.address,
-      billNo: r.billNo, amount: formatAmt(r.amount),
-      sheetRow: r.row, daysOld: r.daysOld
-    });
+    if(isMdc){
+      rows.push({
+        ref: refOf(idx), date: date,
+        bNo: r.bNo, bName: r.bName, bAddr: r.bAddr, bAmt: formatAmt(r.amount),
+        aNo: r.aNo, aName: r.aName, aAddr: r.aAddr,
+        sheetRow: r.row
+      });
+    } else {
+      rows.push({
+        ref: refOf(idx), date: date,
+        aNo: r.consNo, aName: r.name, address: r.address,
+        billNo: r.billNo, amount: formatAmt(r.amount),
+        sheetRow: r.row, daysOld: r.daysOld
+      });
+    }
   });
   renderTable();
   document.getElementById('previewArea').innerHTML = '<div class="empty-state">Check the rows above, then click "Generate Letters".</div>';
   document.getElementById('printArea').innerHTML = "";
 
-  let msg = '<b>' + j.rows.length + '</b> notice(s) loaded, oldest bill first'
-          + (j.rows.length ? ' (oldest ' + j.rows[0].daysOld + ' days, newest ' + j.rows[j.rows.length-1].daysOld + ' days).' : '.');
+  let msg = '<b>' + j.rows.length + '</b> notice(s) loaded';
+  if(!isMdc && j.rows.length) msg += ', oldest bill first (oldest ' + j.rows[0].daysOld + ' days, newest ' + j.rows[j.rows.length-1].daysOld + ' days)';
+  msg += '.';
   const notes = [];
-  if(j.tooRecent) notes.push(j.tooRecent + ' unpaid bill(s) are newer than the limit');
+  if(isMdc){
+    if(j.noLinked) notes.push(j.noLinked + ' MDC row(s) have no linked (old) consumer no. and were left out');
+    if(j.noArrear) notes.push(j.noArrear + ' MDC row(s) have no arrear amount and were left out');
+    const fromWritten = j.rows.filter(r => r.amountFrom === 'written arrear').length;
+    if(fromWritten) notes.push(fromWritten + ' amount(s) are the written arrear because no actual outstanding is in the sheet');
+    if(j.rows.some(r => !r.bName)) notes.push('some rows have no old consumer name, fill them in before printing');
+  } else {
+    if(j.tooRecent) notes.push(j.tooRecent + ' unpaid bill(s) are newer than the limit');
+    if(j.missingBill) notes.push(j.missingBill + ' prepared unpaid row(s) have no bill no./date in the sheet yet: run Backfill in the Tampermonkey dashboard');
+    if(j.rows.some(r => r.amount === "")) notes.push('some rows have no amount, fill them in before printing');
+  }
   if(j.alreadyNoticed) notes.push(j.alreadyNoticed + ' already have a notice (tick the box to include)');
-  if(j.missingBill) notes.push(j.missingBill + ' prepared unpaid row(s) have no bill no./date in the sheet yet: run Backfill in the Tampermonkey dashboard');
   if(isNaN(start) && j.rows.length) notes.push('issue numbers left blank, type them in');
-  if(j.rows.some(r => r.amount === "")) notes.push('some rows have no amount, fill them in before printing');
   if(notes.length) msg += '<br>' + notes.join('<br>');
   shStatus(msg);
 }
@@ -835,9 +858,9 @@ async function markGenerated(){
   const date = items[0].date || todayDMY();
   const list = items.map(r => r.sheetRow + '|' + encodeURIComponent(r.ref)).join(',');
   try {
-    const res = await fetch(shUrl() + 'source=markNotice&date=' + encodeURIComponent(date) + '&items=' + list);
+    const res = await fetch(shUrl() + 'source=markNotice' + (mode === 'MDC' ? '&tab=MDC_Notices' : '') + '&date=' + encodeURIComponent(date) + '&items=' + list);
     const t = (await res.text()).trim();
-    if(/^MARKED:/.test(t)) shStatus('Marked <b>' + t.slice(7) + '</b> row(s) in the sheet (column AI, Generated Notice).');
+    if(/^MARKED:/.test(t)) shStatus('Marked <b>' + t.slice(7) + '</b> row(s) in the sheet (column AI, Generated Notice' + (mode === 'MDC' ? ' of MDC_Notices' : '') + ').');
     else shStatus('The sheet said: ' + esc(t), true);
   } catch(err){
     shStatus('Could not reach the sheet to mark the rows.', true);
